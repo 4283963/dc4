@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 import numpy as np
-from scipy.optimize import linprog
+from scipy.optimize import linprog, minimize
 
 from .config import BatteryConfig, DEFAULT_BATTERY, N_HOURS
 
@@ -33,8 +33,8 @@ def run_simulation(
 ) -> SimulationResult:
     """运行 24 小时离网微电网储能调度优化。
 
-    线性规划模型说明
-    ----------------
+    二次规划(QP)模型说明
+    --------------------
     决策变量（每小时一个，共 24 小时）：
         C[t]  电池充电功率 (kW)，仅在“光伏富余小时”从富余光伏充入
         D[t]  电池放电功率 (kW)，仅在“光伏不足小时”放电补足负荷
@@ -49,9 +49,11 @@ def run_simulation(
         把弃光伪装成损耗、从而虚降弃光量）。
 
     目标函数：min sum(Q[t]) + BIG * sum(U[t]) - eps * sum((N-t) * C[t])
-        优先级：保证“用电”尽量满足(BIG) > 最小化“弃光”(1) > 尽早充电(eps)。
-        第三项为极小权重，仅在弃光相同的解中挑选“先充满电池、满了才弃光”
-        的直观调度，绝不影响弃光最小化与保供电。
+                                  + λ * (sum(C[t]²) + sum(D[t]²))
+        优先级：保证“用电”尽量满足(BIG) > 最小化“弃光”(1) > 尽早充电(eps)
+                > 平滑充放电减小寿命损耗(λ)。
+        最后一项为二次项：大电流成本是小电流的平方倍，有效抑制猛充猛放，
+        让充电曲线更平缓。λ 极小(默认 1e-5)，绝不影响保供电与弃光最小化。
 
     约束：
         1) 功率平衡：C - D + Q - U = PV - Load            (等式)
@@ -90,6 +92,7 @@ def run_simulation(
     soc_max = battery.soc_max
     dt = battery.dt_hours
     BIG = battery.unmet_load_penalty
+    lambda_deg = battery.degradation_cost_coeff
 
     if soc0 < soc_min - 1e-9 or soc0 > soc_max + 1e-9:
         raise ValueError(
@@ -98,13 +101,11 @@ def run_simulation(
         )
 
     nv = 4 * n
-    tie_break = 1.0e-4 * (n - np.arange(n))
-    c = np.concatenate([
-        -tie_break,
-        np.zeros(n),
-        np.ones(n),
-        np.full(n, BIG),
-    ])
+    # 有衰减惩罚时不使用"优先早充" tie-break，让衰减项主导充放电的时间分布，得到更平缓的曲线
+    if lambda_deg > 0.0:
+        tie_break = np.zeros(n)
+    else:
+        tie_break = 1.0e-4 * (n - np.arange(n))
 
     A_eq = np.zeros((n, nv))
     A_eq[:, 0:n] = np.eye(n)
@@ -142,8 +143,16 @@ def run_simulation(
         + [(0.0, float(v)) for v in u_ub]
     )
 
-    res = linprog(
-        c,
+    # ---- 求解器分支：LP vs QP ----
+    # 先解纯线性规划得到 warm-start 初始解
+    c_lp = np.concatenate([
+        -tie_break,
+        np.zeros(n),
+        np.ones(n),
+        np.full(n, BIG),
+    ])
+    res_lp = linprog(
+        c_lp,
         A_ub=A_ub,
         b_ub=b_ub,
         A_eq=A_eq,
@@ -151,6 +160,66 @@ def run_simulation(
         bounds=bounds,
         method="highs",
     )
+
+    if lambda_deg <= 0.0:
+        # 无衰减惩罚：直接用 LP 解
+        res = res_lp
+    else:
+        # 有衰减惩罚：以 LP 解为 warm-start，用 SLSQP 解二次规划
+        def _obj(x: np.ndarray) -> float:
+            C = x[:n]
+            D = x[n:2 * n]
+            Q = x[2 * n:3 * n]
+            U = x[3 * n:]
+            return (
+                float(np.sum(Q))
+                + BIG * float(np.sum(U))
+                - float(np.sum(tie_break * C))
+                + lambda_deg * (float(np.sum(C * C)) + float(np.sum(D * D)))
+            )
+
+        def _obj_jac(x: np.ndarray) -> np.ndarray:
+            C = x[:n]
+            D = x[n:2 * n]
+            grad = np.zeros(nv)
+            grad[:n] = -tie_break + 2.0 * lambda_deg * C
+            grad[n:2 * n] = 2.0 * lambda_deg * D
+            grad[2 * n:3 * n] = 1.0
+            grad[3 * n:] = BIG
+            return grad
+
+        def _eq_fun(x: np.ndarray) -> np.ndarray:
+            return A_eq @ x - b_eq
+
+        def _eq_jac(x: np.ndarray) -> np.ndarray:
+            return A_eq
+
+        def _ineq_fun(x: np.ndarray) -> np.ndarray:
+            return b_ub - A_ub @ x
+
+        def _ineq_jac(x: np.ndarray) -> np.ndarray:
+            return -A_ub
+
+        constraints = [
+            {"type": "eq", "fun": _eq_fun, "jac": _eq_jac},
+            {"type": "ineq", "fun": _ineq_fun, "jac": _ineq_jac},
+        ]
+
+        # warm-start: 从 LP 最优解出发，SLSQP 收敛更稳
+        x0 = np.array(res_lp.x) if (res_lp.success and res_lp.x is not None) else np.zeros(nv)
+
+        res = minimize(
+            _obj,
+            x0,
+            jac=_obj_jac,
+            constraints=constraints,
+            bounds=bounds,
+            method="SLSQP",
+            options={"maxiter": 1000, "ftol": 1e-8},
+        )
+        # 若 SLSQP 失败，退回到 LP 解（不牺牲主目标）
+        if res.x is None or not res.success:
+            res = res_lp
 
     empty = [0.0] * n
     if res.x is None or not res.success:

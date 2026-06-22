@@ -39,6 +39,7 @@ def run_simulation_endpoint(req: SimulationRequest) -> SimulationResponse:
         max_discharge_power_kw=req.max_discharge_power_kw,
         soc_min_percent=req.soc_min_percent,
         soc_max_percent=req.soc_max_percent,
+        degradation_cost_coeff=req.degradation_cost_coeff,
     )
     try:
         result = run_simulation(

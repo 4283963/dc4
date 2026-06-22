@@ -16,6 +16,7 @@ class BatteryConfig:
     soc_max: float = 1.00
     dt_hours: float = 1.0
     unmet_load_penalty: float = 1.0e6
+    degradation_cost_coeff: float = 5.0e-4
 
 
 DEFAULT_BATTERY = BatteryConfig()
@@ -30,6 +31,7 @@ def build_battery_config(
     max_discharge_power_kw: float | None = None,
     soc_min_percent: float | None = None,
     soc_max_percent: float | None = None,
+    degradation_cost_coeff: float | None = None,
     base: BatteryConfig = DEFAULT_BATTERY,
 ) -> BatteryConfig:
     overrides: dict[str, float] = {}
@@ -47,4 +49,6 @@ def build_battery_config(
         overrides["soc_min"] = soc_min_percent / 100.0
     if soc_max_percent is not None:
         overrides["soc_max"] = soc_max_percent / 100.0
+    if degradation_cost_coeff is not None:
+        overrides["degradation_cost_coeff"] = degradation_cost_coeff
     return replace(base, **overrides)

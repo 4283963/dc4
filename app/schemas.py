@@ -35,6 +35,7 @@ class SimulationRequest(BaseModel):
     max_discharge_power_kw: Optional[float] = Field(default=None, gt=0)
     soc_min_percent: Optional[float] = Field(default=None, ge=0, le=100)
     soc_max_percent: Optional[float] = Field(default=None, ge=0, le=100)
+    degradation_cost_coeff: Optional[float] = Field(default=None, ge=0, description="电池衰减成本系数(单位成本/kW²)，越大越倾向平缓充放电")
 
     @field_validator("pv_forecast", "load_forecast")
     @classmethod
